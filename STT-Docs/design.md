@@ -1,142 +1,149 @@
 # KoeNote（コエノート）— 設計書
 
-**バージョン**: 2.0  
-**作成日**: 2026-04-18  
-**ステータス**: ドラフト改定版
+**バージョン**: 3.0  
+**作成日**: 2026-04-19  
+**ステータス**: 戦略整合版ドラフト
 
 ---
 
-## 1. システムアーキテクチャ
+## 1. 設計方針
 
-### 1.1 全体構成
+### 1.1 設計原則
 
-```
-┌───────────────────────────────────────────────────────────┐
-│                    iOSアプリ（SwiftUI）                     │
-│                                                            │
-│  ┌───────────┐  ┌──────────┐  ┌─────────────────────────┐ │
-│  │ 録音エンジン │  │スキャンUI │  │ セッション管理           │ │
-│  │AVFoundation│  │VisionKit │  │ SwiftData               │ │
-│  └─────┬─────┘  └────┬─────┘  └───────────┬─────────────┘ │
-│        │              │                    │                │
-│  ┌─────▼──────────────▼────────────────────▼─────────────┐ │
-│  │                ドメイン層（ビジネスロジック）             │ │
-│  │  RecordingService │ OCRService │ NoteService            │ │
-│  │  OfflineQueue     │ TermExtractor                       │ │
-│  └─────┬──────────────────────────────────┬──────────────┘ │
-│        │                                  │                 │
-│  ┌─────▼────────────┐          ┌──────────▼─────────────┐  │
-│  │ リアルタイムASR    │          │  APIGatewayClient      │  │
-│  │ SFSpeechRecognizer│          │  （プロキシ経由）        │  │
-│  │（プレビュー専用）  │          └──────────┬─────────────┘  │
-│  └──────────────────┘                      │                │
-└─────────────────────────────────────────────┼───────────────┘
-                                              │ HTTPS
-                                 ┌────────────▼────────────────┐
-                                 │    バックエンドプロキシ        │
-                                 │   （Cloudflare Workers等）    │
-                                 │  ・APIキー管理               │
-                                 │  ・デバイス認証・レート制限    │
-                                 │  ・コスト上限制御             │
-                                 └──┬───────────────────┬──────┘
-                                    │                   │
-                         ┌──────────▼──────┐  ┌────────▼──────────┐
-                         │  OpenAI API     │  │  Anthropic API     │
-                         │  Whisper        │  │  claude-haiku-4-5  │
-                         │ （録音後ASR）    │  │  claude-sonnet-4-6 │
-                         └─────────────────┘  └────────────────────┘
+KoeNote の設計は、次の4原則に従う。
 
-                         ┌─────────────────────────────────────────┐
-                         │       Firebase（Phase 3〜）              │
-                         │   Auth │ Firestore │ Storage            │
-                         └─────────────────────────────────────────┘
-```
+1. **録音は絶対に落とさない**
+価値の起点は音声データであるため、録音の堅牢性を最優先とする。
 
-### 1.2 ASR戦略（デュアルASR）
+2. **AI出力は必ず根拠に紐付ける**
+ノートは生成できるだけでなく、どの発話から生成されたかを追跡できる必要がある。
 
-| ASR | 用途 | タイミング | 精度要件 |
-|-----|------|-----------|---------|
-| SFSpeechRecognizer | リアルタイムプレビュー | 録音中 | ベストエフォート（成功指標外） |
-| Whisper API | 高精度文字起こし | 録音完了後 | WER < 20%（日本語） |
+3. **資料と過去知識を積極活用する**
+単発セッションではなく、継続利用で精度が上がる構造を持たせる。
 
-- 録音中はSFSpeechRecognizerでプレビューテキストを表示するが、このテキストは保存・後続処理には使用しない
-- 録音完了後、音声ファイルをWhisper APIに送信し、タイムスタンプ付きの高精度な文字起こし結果を取得する
-- SFSpeechRecognizerが利用不可（権限拒否等）でも録音とノート生成には影響しない
+4. **全文レビューを強いない**
+ユーザーに全部を確認させず、怪しい箇所だけレビューさせる。
 
-### 1.3 データフロー概要
+### 1.2 全体アーキテクチャ
 
 ```
-音声入力
-  → AVAudioEngine（録音・ファイル保存）
-  → [並行] SFSpeechRecognizer（プレビュー表示、保存しない）
-  → 録音停止
-  → 音声ファイル(.m4a)をローカル保存
-  → バックエンドプロキシ経由でWhisper API（高精度文字起こし）
-  → rawTranscript保存（タイムスタンプ付きセグメント）
-  → [資料あり] 用語抽出（OCRテキスト → 構造化用語リスト）
-  → バックエンドプロキシ経由でClaude API（AI補正）
-  → correctedTranscript保存
-  → [ユーザー操作] ノート生成（Claude API）
-  → ノート保存（Markdown）
+┌──────────────────────────────────────────────────────────────┐
+│                     iOS App（SwiftUI）                        │
+│                                                              │
+│  Recording UI   Session UI   Note UI   Review Queue UI       │
+│       │            │           │             │                │
+│       └────────────┴───────────┴─────────────┘                │
+│                           │                                  │
+│   ┌───────────────────────▼───────────────────────────────┐   │
+│   │                  Application Layer                    │   │
+│   │ RecordingCoordinator                                  │   │
+│   │ SessionPipeline                                       │   │
+│   │ NoteComposer                                          │   │
+│   │ ReviewQueueBuilder                                    │   │
+│   │ ContextMemoryManager                                  │   │
+│   └───────────────┬───────────────────────┬───────────────┘   │
+│                   │                       │                   │
+│   ┌───────────────▼─────────────┐ ┌──────▼────────────────┐  │
+│   │ Local Persistence            │ │ Device Services       │  │
+│   │ SwiftData                    │ │ AVFoundation          │  │
+│   │ Session / Segment / Note     │ │ Vision / VisionKit    │  │
+│   │ Evidence / ReviewItem / Term │ │ SFSpeechRecognizer    │  │
+│   └───────────────┬─────────────┘ └──────────┬────────────┘  │
+│                   │                           │               │
+└───────────────────┼───────────────────────────┼───────────────┘
+                    │                           │
+                    │ HTTPS                     │ Local preview only
+                    ▼                           ▼
+          ┌──────────────────────┐    ┌────────────────────────┐
+          │ Backend Proxy        │    │ Realtime Preview ASR    │
+          │ Auth / Rate Limit    │    │ SFSpeechRecognizer      │
+          │ Cost Control         │    │ 非保存・参考表示のみ     │
+          └──────┬─────────┬─────┘    └────────────────────────┘
+                 │         │
+        ┌────────▼───┐ ┌──▼─────────────┐
+        │ OpenAI API │ │ Anthropic API  │
+        │ ASR        │ │ Correction /   │
+        │            │ │ Note / Terms   │
+        └────────────┘ └────────────────┘
 ```
 
 ---
 
-## 2. 技術スタック
+## 2. 価値を生むコアパイプライン
 
-| レイヤー | 技術 | 選定理由 |
-|----------|------|----------|
-| UIフレームワーク | SwiftUI | iOS 17以降は宣言的UIが成熟。状態管理が容易 |
-| 状態管理 | Observation（@Observable） | iOS 17で導入。Combine不要でシンプル |
-| リアルタイムASR（プレビュー） | SFSpeechRecognizer | オンデバイス・無料・プライバシー保護。プレビュー専用 |
-| 録音後ASR（主ASR） | OpenAI Whisper API | $0.006/分。長時間音声対応・高精度・日本語対応 |
-| ドキュメントスキャン | VNDocumentCameraViewController | iOS標準。追加ライブラリ不要 |
-| OCR | Vision（VNRecognizeTextRequest） | オンデバイス・高精度・日本語対応 |
-| AI補正 | Claude API（Haiku 4.5） | 低コスト・高速。誤認識修正に十分な性能 |
-| ノート生成 | Claude API（Sonnet 4.6） | 高品質な構造化文書生成に必要な推論力 |
-| ローカルDB | SwiftData | iOS 17標準。CoreDataより宣言的で簡潔 |
-| バックエンドプロキシ | Cloudflare Workers | エッジ実行・低レイテンシ・無料枠あり |
-| ネットワーク | URLSession / async-await | 標準ライブラリで十分 |
-| クラウドDB（Phase 3） | Firestore | リアルタイム同期・オフラインキャッシュ対応 |
-| 認証（Phase 3） | Firebase Auth | Apple Sign In対応 |
+### 2.1 Phase 1 の処理パイプライン
+
+```
+録音
+  → 音声ファイル保存
+  → 高精度ASR
+  → セグメント化された原文保存
+  → OCR + 用語抽出
+  → 用語メモリ統合
+  → セグメント単位補正
+  → 根拠付きノート生成
+  → レビューキュー生成
+```
+
+### 2.2 差別化ポイントがどこで生まれるか
+
+| 段階 | 一般的なサービス | KoeNote |
+|------|------------------|---------|
+| 文字起こし | 全文化して終わり | セグメント + 時間情報を保持 |
+| 資料活用 | OCRを添付するだけ | 用語抽出して補正へ反映 |
+| 要約 | 本文から要約を生成 | 根拠参照付きノートを生成 |
+| 品質確認 | 全文を人が確認 | 低信頼箇所だけレビュー |
+| 学習 | セッションごとに完結 | 用語メモリが次回へ継承 |
 
 ---
 
-## 3. 画面設計
+## 3. 技術スタック
 
-### S01 ホーム（セッション一覧）
+| レイヤー | 技術 | 理由 |
+|----------|------|------|
+| UI | SwiftUI | iOS 17 以降で十分成熟 |
+| 状態管理 | Observation | 軽量で ViewModel と相性が良い |
+| 録音 | AVFoundation | バックグラウンド録音に対応 |
+| リアルタイム参考表示 | SFSpeechRecognizer | プレビュー専用で利用 |
+| 録音後ASR | OpenAI API | 長時間音声に対応しやすい |
+| OCR | Vision / VisionKit | 標準フレームワークで十分 |
+| AI補正 / 用語抽出 / ノート生成 | Anthropic API | 構造化出力と要約品質を活かす |
+| ローカルDB | SwiftData | 構造化モデル管理が容易 |
+| バックエンドプロキシ | Cloudflare Workers | キー秘匿・レート制限・低運用コスト |
+| 同期（Phase 3） | Firebase | Auth / Firestore / Storage をまとめて扱える |
+
+---
+
+## 4. 画面設計
+
+### S01 ホーム
 
 ```
 ┌──────────────────────────────┐
 │ KoeNote              [設定⚙] │
 ├──────────────────────────────┤
-│ [🎙 新しい録音を開始]         │
+│ [🎙 録音を開始]              │
 ├──────────────────────────────┤
 │ 最近のセッション              │
 │ ┌────────────────────────┐   │
-│ │ 📄 2026/04/18 情報工学  │   │
-│ │    52分 | ノート済      │   │
-│ │    ● 処理完了           │   │
+│ │ 📄 情報工学 第12回      │   │
+│ │    52分 │ ✅ 完了       │   │
+│ │    🔗 用語23件蓄積済み   │   │
 │ └────────────────────────┘   │
 │ ┌────────────────────────┐   │
-│ │ 📄 2026/04/15 マーケ勉強│   │
-│ │    38分 | 補正済        │   │
-│ │    ◐ ノート未生成       │   │
+│ │ 📄 マーケ勉強会         │   │
+│ │    38分 │ ⏳ 補正中...  │   │
 │ └────────────────────────┘   │
 │ ┌────────────────────────┐   │
-│ │ 🎙 2026/04/14 ゼミ     │   │
-│ │    ⏳ 文字起こし中...    │   │
+│ │ 🎙 ゼミ                │   │
+│ │    ☁️ オフライン保留     │   │
 │ └────────────────────────┘   │
 └──────────────────────────────┘
 ```
 
-**主要要素**
-- セッションカード：タイトル（編集可）・日時・録音時間・処理状態
-- 処理状態インジケーター（録音済/文字起こし中/補正済/ノート済/エラー）
-- 新規録音ボタン（常にアクセス可能）
-- スワイプで削除
-
----
+- セッションカード：タイトル（編集可）・録音時間・処理状態・用語蓄積状況
+- 処理状態は `SessionState` に連動
+- テーマタグ（topicKey）をカードに表示し、同テーマの連続性を示す
 
 ### S02 録音画面
 
@@ -144,65 +151,52 @@
 ┌──────────────────────────────┐
 │ [←戻る]  録音中...   [📄資料]│
 ├──────────────────────────────┤
-│                              │
 │    ████ ▌▌▌██ ▌▌▌███        │
 │         波形インジケーター     │
 │         01:23:45             │
-│                              │
 ├──────────────────────────────┤
 │ プレビュー（参考表示）        │
 │ ┌────────────────────────┐   │
 │ │...本日は機械学習の基礎  │   │
-│ │について説明します。まず │   │
-│ │教師あり学習から...      │   │
+│ │について説明します...    │   │
 │ └────────────────────────┘   │
-│ ※録音後に高精度で文字起こし  │
+│ ※録音後に高精度で処理します  │
 ├──────────────────────────────┤
 │        [■ 停止]              │
 └──────────────────────────────┘
 ```
 
-**主要要素**
-- 録音時間カウンター
-- 音声波形インジケーター（AVAudioPCMBufferから生成）
-- リアルタイムプレビュー（SFSpeechRecognizer、「参考表示」と明示）
-- 資料スキャンボタン（録音中でもアクセス可）
-- 停止ボタン → 自動で文字起こしジョブ開始 → S03へ遷移
-
----
+- プレビューは SFSpeechRecognizer による参考表示（保存しない）
+- 停止後は自動でパイプライン開始、S03へ遷移
 
 ### S03 セッション詳細
 
 ```
 ┌──────────────────────────────┐
-│ [←] セッション詳細           │
+│ [←] 情報工学 第12回  [テーマ]│
 ├──────────────────────────────┤
-│ 🤖 AI補正中...  ████░░ 60%   │
+│ ✅ 完了  │  ⚠ 要レビュー 3件 │
 ├───────┬──────────┬───────────┤
 │[原文] │ [補正後] │ [ノート]  │
 ├───────┴──────────┴───────────┤
-│ 補正後テキスト                │
+│ ノート                       │
 │ ┌────────────────────────┐   │
-│ │本日は機械学習の基礎につ │   │
-│ │いて説明します。まず教師 │   │
-│ │あり学習（supervised     │   │
-│ │learning）から説明し...  │   │
+│ │ ## 主要概念             │   │
+│ │ 教師あり学習は入力と... │   │
+│ │ 📎 "教師あり学習はラベル│   │
+│ │    付きデータから..."   │   │
+│ │    🔊 01:23 ▶           │   │
 │ └────────────────────────┘   │
-│                              │
 ├──────────────────────────────┤
-│ [📝 ノート生成] [📋 コピー]  │
+│ [📝 再生成] [⚠ レビュー] [↗]│
 └──────────────────────────────┘
 ```
 
-**主要要素**
-- 3タブ切替：原文（rawTranscript） / 補正後 / ノート
-- 処理進捗インジケーター（文字起こし中/補正中）
-- テキスト手動編集対応（補正後タブ）
-- ノート生成ボタン（補正完了後に有効化）
-- ノート生成時にテンプレート選択（学習ノート/議事メモ）
-- Phase 1では差分ハイライト表示は行わない
-
----
+- 3タブ：原文 / 補正後 / ノート
+- ノートタブでは各ブロックに根拠引用が表示される
+- 📎 引用をタップ → 元セグメント表示
+- 🔊 ボタンをタップ → 該当区間の音声を再生
+- ⚠ レビューボタンでレビューキュー画面（S06）へ遷移
 
 ### S04 ドキュメントスキャン
 
@@ -210,25 +204,13 @@
 ┌──────────────────────────────┐
 │ [←] 資料スキャン             │
 ├──────────────────────────────┤
-│                              │
 │   [VisionKit カメラUI]       │
-│   ドキュメントを枠内に        │
-│   合わせてください            │
-│                              │
-│                              │
 ├──────────────────────────────┤
 │ スキャン済み: 3ページ         │
+│ 抽出用語: 15件               │
 │ [+ ページ追加] [✓ 完了]      │
 └──────────────────────────────┘
 ```
-
-**主要要素**
-- VNDocumentCameraViewControllerの統合
-- スキャン済みページのサムネイル一覧
-- OCR処理状況表示
-- セッションへの紐付け確認
-
----
 
 ### S05 ノート編集
 
@@ -241,361 +223,387 @@
 │ # 機械学習の基礎             │
 │                              │
 │ ## 主要概念                  │
-│ - 教師あり学習               │
-│   - 分類と回帰の違い         │
-│ - 教師なし学習               │
-│   - クラスタリング           │
+│ - 教師あり学習    📎🔊       │
+│ - 教師なし学習    📎🔊       │
 │                              │
 │ ## まとめ                    │
-│ - ...                        │
-│                              │
-│ ## キーワード                │
-│ supervised learning, ...     │
+│ - ...             📎🔊       │
 ├──────────────────────────────┤
 │ [🔄 再生成] [📋 コピー]     │
 └──────────────────────────────┘
 ```
 
-**主要要素**
-- Markdown形式のノート表示・編集
-- テンプレート種別表示
-- 再生成ボタン（別テンプレートで再生成可能）
-- 共有ボタン（テキスト共有）
-- コピーボタン
+- 各ブロック右端に根拠アイコン（📎）と音声再生アイコン（🔊）
+- Markdown編集モードと閲覧モードの切替
+
+### S06 レビューキュー
+
+```
+┌──────────────────────────────┐
+│ [←] レビュー対象  3/8件 確認済│
+├──────────────────────────────┤
+│ 🔴 優先度: 高                │
+│ ┌────────────────────────┐   │
+│ │ セグメント #14          │   │
+│ │ "きょうしありがくしゅう"│   │
+│ │ → 「教師あり学習」?     │   │
+│ │ 理由: 用語と音が近いが  │   │
+│ │       補正未適用        │   │
+│ │ [✓ 確認済] [✏ 修正]    │   │
+│ └────────────────────────┘   │
+│ 🟡 優先度: 中                │
+│ ┌────────────────────────┐   │
+│ │ ノートブロック #3       │   │
+│ │ 「回帰分析の精度は...」 │   │
+│ │ 理由: 根拠セグメントなし│   │
+│ │ [✓ 確認済] [✏ 修正]    │   │
+│ └────────────────────────┘   │
+└──────────────────────────────┘
+```
+
+- レビュー対象を優先度順に一覧表示
+- 各アイテムに理由と推奨アクションを表示
+- 確認済みマークで進捗管理
+- 修正ボタンで該当セグメントまたはノートブロックへジャンプ
 
 ---
 
-## 4. データモデル
+## 5. ドメインモデル
 
-### 4.1 SwiftData（ローカル）
+### 5.1 モデル全体像
+
+KoeNote の中核は `Session` ではなく、**Session + Segment + Evidence + TermMemory + ReviewItem** の組み合わせである。
 
 ```swift
-// MARK: - セッション
-
 @Model
-class Session {
+final class Session {
     var id: UUID
     var title: String
     var createdAt: Date
     var duration: TimeInterval
-    var audioRelativePath: String?    // Documents相対パス（URL非依存）
-    var processingState: ProcessingState
+    var audioRelativePath: String?
+    var state: SessionState
     var failureReason: String?
+    var topicKey: String?               // 同一テーマ識別用（ユーザー設定 or AI提案）
+    var pipelineAttemptId: UUID?        // 冪等性保証用
 
-    // 文字起こし（セグメント構造）
+    @Relationship(deleteRule: .cascade)
     var segments: [TranscriptSegment]
-    // 補正後テキスト（全文結合キャッシュ）
-    var correctedFullText: String?
 
-    // ノート
-    var note: Note?
-
-    // 資料
+    @Relationship(deleteRule: .cascade)
     var documents: [ScannedDocument]
-    var extractedTerms: [TermEntry]   // 資料から抽出した用語
 
-    var tags: [String]
+    @Relationship(deleteRule: .cascade)
+    var notes: [NoteDocument]
+
+    @Relationship(deleteRule: .cascade)
+    var reviewItems: [ReviewItem]
 }
-
-// MARK: - 処理状態
-
-enum ProcessingState: String, Codable {
-    case recording          // 録音中
-    case recorded           // 録音完了、文字起こし待ち
-    case transcribing       // Whisper API 処理中
-    case transcribed        // 文字起こし完了、補正待ち
-    case correcting         // AI補正中
-    case corrected          // 補正完了（ノート未生成）
-    case noteGenerating     // ノート生成中
-    case completed          // 全処理完了
-    case failed             // エラー発生（failureReasonに詳細）
-}
-
-// MARK: - 文字起こしセグメント
 
 @Model
-class TranscriptSegment {
+final class TranscriptSegment {
     var id: UUID
     var session: Session
     var index: Int
-    var text: String                 // ASR原文
-    var correctedText: String?       // 補正後テキスト
-    var startTime: TimeInterval      // 音声内の開始位置（秒）
-    var endTime: TimeInterval        // 音声内の終了位置（秒）
+    var rawText: String
+    var correctedText: String?
+    var startTime: TimeInterval
+    var endTime: TimeInterval
+    var confidenceScore: Double?
+    var needsReview: Bool
 }
 
-// MARK: - スキャン資料
-
 @Model
-class ScannedDocument {
+final class ScannedDocument {
     var id: UUID
     var session: Session
     var pageIndex: Int
-    var imageData: Data
+    var imagePath: String
     var ocrText: String
-    var scannedAt: Date
 }
 
-// MARK: - 抽出用語
-
 @Model
-class TermEntry {
+final class TermMemoryEntry {
     var id: UUID
-    var session: Session
-    var term: String                 // 用語（表記）
-    var reading: String?             // 読み（カタカナ）
-    var category: String?            // 分類（人名/組織名/専門用語/略語等）
+    var topicKey: String
+    var term: String
+    var reading: String?
+    var category: String
+    var source: String                  // document / correction / user
+    var isDisabled: Bool
+    var lastUsedAt: Date
 }
 
-// MARK: - ノート
-
 @Model
-class Note {
+final class NoteDocument {
     var id: UUID
     var session: Session
-    var noteType: NoteType
-    var content: String              // Markdown形式
-    var createdAt: Date
-    var updatedAt: Date
+    var type: NoteType
+    var markdown: String
+
+    @Relationship(deleteRule: .cascade)
+    var blocks: [NoteBlock]
+}
+
+@Model
+final class NoteBlock {
+    var id: UUID
+    var note: NoteDocument
+    var order: Int
+    var heading: String?
+    var body: String
+    var blockType: String               // summary / decision / concept / action
+    var confidenceScore: Double?
+
+    @Relationship(deleteRule: .cascade)
+    var evidences: [EvidenceAnchor]
+}
+
+@Model
+final class EvidenceAnchor {
+    var id: UUID
+    var block: NoteBlock
+    var segmentIndex: Int
+    var quote: String
+    var startTime: TimeInterval
+    var endTime: TimeInterval
+}
+
+@Model
+final class ReviewItem {
+    var id: UUID
+    var session: Session
+    var type: ReviewItemType            // low_confidence_segment / weak_evidence_block
+    var targetId: UUID
+    var reason: String
+    var priority: Int
+    var resolved: Bool
+}
+
+enum SessionState: String, Codable {
+    case recording
+    case recorded
+    case transcribing
+    case transcribed
+    case correcting
+    case corrected
+    case noteGenerating
+    case reviewBuilding
+    case completed
+    case failed
 }
 
 enum NoteType: String, Codable {
-    case studyNote      // 学習ノート
-    case meetingMemo    // 議事メモ
+    case studyNote
+    case meetingMemo
 }
 
-// MARK: - Phase 2
-
-@Model
-class TodoItem {
-    var id: UUID
-    var session: Session
-    var title: String
-    var dueDate: Date?
-    var isCompleted: Bool
-    var sourceQuote: String?         // 元の文字起こし参照箇所
-    var createdAt: Date
+enum ReviewItemType: String, Codable {
+    case lowConfidenceSegment
+    case weakEvidenceBlock
 }
 ```
 
-### 4.2 Firestore スキーマ（Phase 3）
+### 5.2 なぜこのモデルが必要か
 
+- `TranscriptSegment` を持つことで、発話区間へ戻れる
+- `EvidenceAnchor` を持つことで、ノートに根拠を持たせられる
+- `TermMemoryEntry` を持つことで、次回セッションに学習を持ち越せる
+- `ReviewItem` を持つことで、全文レビューを回避できる
+
+---
+
+## 6. 主要コンポーネント設計
+
+### 6.1 RecordingCoordinator
+
+責務:
+
+- AVAudioSession と AVAudioEngine の制御
+- 録音ファイルの生成と終了処理
+- バックグラウンド録音継続
+- 任意でリアルタイムプレビュー開始
+
+### 6.2 SessionPipeline
+
+責務:
+
+- `recorded -> transcribing -> correcting -> noteGenerating -> reviewBuilding` の遷移管理
+- API呼び出しのオーケストレーション
+- 冪等な再実行
+- 失敗時の状態保持
+
+### 6.3 ContextMemoryManager
+
+責務:
+
+- OCR由来の用語抽出
+- topicKey 単位の既存用語取得
+- 補正ジョブへ渡す用語セットの統合
+- 不要用語の無効化反映
+
+topicKey 割り当て戦略:
+
+- ユーザーがセッション作成時に手動設定（「情報工学」「マーケゼミ」等）
+- 未設定の場合、ノート生成後にAIがタイトルからトピックを提案し、ユーザーが承認する
+- 同一 topicKey のセッション間で TermMemoryEntry を共有する
+
+### 6.4 NoteComposer
+
+責務:
+
+- 補正済みセグメント列からノートを生成
+- AI出力を `NoteBlock` 単位へ変換
+- 各ブロックに `EvidenceAnchor` を付与
+
+### 6.5 ReviewQueueBuilder
+
+責務:
+
+- セグメント信頼度、未一致用語、根拠不足ブロックを評価
+- レビュー対象を優先度付きで生成
+
+---
+
+## 7. 主要フロー
+
+### 7.1 録音からノート完成まで
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as iOS App
+    participant Pipe as SessionPipeline
+    participant Proxy as Backend Proxy
+    participant ASR as ASR API
+    participant AI as Anthropic API
+    participant DB as SwiftData
+
+    U->>App: 録音開始
+    App->>DB: Session(state=recording)
+    U->>App: 録音停止
+    App->>DB: Session(state=recorded)
+
+    App->>Pipe: startPipeline(sessionId)
+    Pipe->>DB: state=transcribing
+    Pipe->>Proxy: /v1/transcribe(audio)
+    Proxy->>ASR: transcription request
+    ASR-->>Proxy: segments
+    Proxy-->>Pipe: segments
+    Pipe->>DB: TranscriptSegment 保存
+    Pipe->>DB: state=transcribed
+
+    Pipe->>Proxy: /v1/extract-terms(ocrText + topicKey)
+    Proxy->>AI: terms extraction
+    AI-->>Proxy: terms
+    Proxy-->>Pipe: terms
+
+    Pipe->>DB: state=correcting
+    Pipe->>Proxy: /v1/correct(segments + terms)
+    Proxy->>AI: correction
+    AI-->>Proxy: corrected segments
+    Proxy-->>Pipe: corrected segments
+    Pipe->>DB: correctedText 保存
+    Pipe->>DB: state=corrected
+
+    Pipe->>DB: state=noteGenerating
+    Pipe->>Proxy: /v1/generate-note(corrected segments + terms)
+    Proxy->>AI: structured note generation
+    AI-->>Proxy: note blocks + evidence
+    Proxy-->>Pipe: structured note
+    Pipe->>DB: NoteDocument / NoteBlock / EvidenceAnchor 保存
+
+    Pipe->>DB: state=reviewBuilding
+    Pipe->>Pipe: buildReviewQueue()
+    Pipe->>DB: ReviewItem 保存
+    Pipe->>DB: state=completed
 ```
-/users/{userId}
-  - displayName: string
-  - createdAt: timestamp
 
-/projects/{projectId}
-  - title: string
-  - ownerId: string
-  - memberIds: string[]              // UID配列（ルール判定用）
-  - createdAt: timestamp
+### 7.2 用語メモリ統合フロー
 
-/projects/{projectId}/members/{userId}
-  - role: "viewer" | "editor" | "admin"
-  - joinedAt: timestamp
-
-/projects/{projectId}/sessions/{sessionId}
-  - title: string
-  - createdAt: timestamp
-  - duration: number
-  - audioStoragePath: string
-  - processingState: string
-  - segments: [{text, correctedText, startTime, endTime}]
-  - correctedFullText: string
-  - noteType: string
-  - noteContent: string
+```mermaid
+flowchart TD
+    A[OCR text] --> B[AIで用語抽出]
+    C[topicKeyに紐づく既存用語] --> D[用語統合]
+    B --> D
+    D --> E[重複除去]
+    E --> F[補正プロンプトへ投入]
+    F --> G[補正後に新規有効用語を更新]
 ```
 
-```javascript
-// Firestore Security Rules
-rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
-    match /projects/{projectId} {
-      allow read, write: if request.auth != null &&
-        request.auth.uid in resource.data.memberIds;
+### 7.3 レビューキュー生成ルール
 
-      match /members/{userId} {
-        allow read: if request.auth != null &&
-          request.auth.uid in
-            get(/databases/$(database)/documents/projects/$(projectId)).data.memberIds;
-      }
+レビュー対象は以下の複合条件で作る。
 
-      match /sessions/{sessionId} {
-        allow read: if request.auth != null &&
-          request.auth.uid in
-            get(/databases/$(database)/documents/projects/$(projectId)).data.memberIds;
-        allow write: if request.auth != null &&
-          request.auth.uid in
-            get(/databases/$(database)/documents/projects/$(projectId)).data.memberIds &&
-          get(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)).data.role in ["editor", "admin"];
-      }
+- ASR / 補正信頼度が閾値未満
+- 用語メモリに近いが未一致な語が存在
+- ノートブロックに evidence が 0 件
+- 1ブロックあたりの evidence 数が少なすぎる
+- 引用と本文の意味距離が大きい
+
+---
+
+## 8. API設計
+
+### 8.1 プロキシの責務
+
+- APIキー隠蔽
+- デバイス認証
+- レート制限
+- コスト制御
+- レスポンスの正規化
+- 将来のモデル差し替え吸収
+
+### 8.2 エンドポイント
+
+| Method | Path | AIモデル | 入力 | 出力 |
+|--------|------|---------|------|------|
+| POST | `/v1/transcribe` | Whisper（gpt-4o-transcribe） | 音声ファイル | `segments[]`（timestamps付き） |
+| POST | `/v1/extract-terms` | claude-haiku-4-5 | OCRテキスト, topicKey | `terms[]` |
+| POST | `/v1/correct` | claude-haiku-4-5 | raw segments, terms | `correctedSegments[]` |
+| POST | `/v1/generate-note` | claude-sonnet-4-6 | corrected segments, noteType, terms | `noteBlocks[]` + `evidences[]` |
+
+**レビューキュー生成はローカル処理**（6.5 ReviewQueueBuilder）で行い、API呼び出しは不要。
+
+### 8.3 APIレスポンス例
+
+#### `/v1/generate-note`
+
+```json
+{
+  "noteBlocks": [
+    {
+      "order": 1,
+      "heading": "主要概念",
+      "body": "教師あり学習は入力と正解ラベルの対応から学習する手法。",
+      "blockType": "concept",
+      "confidenceScore": 0.91,
+      "evidences": [
+        {
+          "segmentIndex": 12,
+          "quote": "教師あり学習はラベル付きデータから学ぶ手法です",
+          "startTime": 120.4,
+          "endTime": 126.8
+        }
+      ]
     }
-  }
+  ]
 }
 ```
 
----
+### 8.4 冪等性
 
-## 5. 処理状態管理
-
-### 5.1 状態遷移図
-
-```
-recording
-  │ [停止]
-  ▼
-recorded
-  │ [自動・ネットワーク接続時]
-  ▼
-transcribing ──[失敗]──→ failed
-  │ [完了]                  ▲
-  ▼                         │
-transcribed                 │
-  │ [自動]                  │
-  ▼                         │
-correcting ────[失敗]───────┘
-  │ [完了]                  ▲
-  ▼                         │
-corrected                   │
-  │ [ユーザー操作]          │
-  ▼                         │
-noteGenerating ─[失敗]──────┘
-  │ [完了]
-  ▼
-completed
-```
-
-### 5.2 状態遷移ルール
-
-| 遷移 | トリガー | 条件 |
-|------|---------|------|
-| recorded → transcribing | 録音停止後に自動 | ネットワーク接続あり |
-| transcribed → correcting | 文字起こし完了後に自動 | — |
-| corrected → noteGenerating | ユーザーがノート生成ボタン押下 | — |
-| * → failed | API/ネットワークエラー | failureReasonに詳細記録 |
-| failed → 失敗した段階 | ユーザーが再実行ボタン押下 | — |
+- 各セッションに `pipelineAttemptId` を持たせる
+- 同一段階の再試行では重複保存を避ける
+- `generate-note` は既存ノートの上書きか版管理かを明示する
 
 ---
 
-## 6. 主要フローのシーケンス図
+## 9. プロンプト設計
 
-### 6.1 録音 → 録音後文字起こし → AI補正フロー
+### 9.1 用語抽出プロンプト
 
-```mermaid
-sequenceDiagram
-    participant U as ユーザー
-    participant App as iOSアプリ
-    participant SF as SFSpeechRecognizer
-    participant DB as SwiftData
-    participant Proxy as バックエンドプロキシ
-    participant Whisper as Whisper API
-    participant Claude as Claude API
-
-    U->>App: 録音開始ボタン押下
-    App->>App: AVAudioEngine開始（ファイル保存）
-    App->>SF: プレビュー認識開始（ベストエフォート）
-    loop 録音中
-        SF-->>App: プレビューテキスト（逐次、保存しない）
-        App-->>U: プレビュー表示更新
-    end
-    U->>App: 停止ボタン押下
-    App->>App: 音声ファイル(.m4a)保存
-    App->>DB: Session保存（state: recorded）
-
-    Note over App,Whisper: 録音後文字起こし（主ASR）
-    App->>DB: state → transcribing
-    App->>Proxy: 音声ファイル送信
-    Proxy->>Whisper: 文字起こしリクエスト（timestamps付き）
-    Whisper-->>Proxy: セグメント配列（text + timestamps）
-    Proxy-->>App: セグメント配列
-    App->>DB: TranscriptSegment保存、state → transcribed
-
-    Note over App,Claude: AI補正
-    App->>DB: state → correcting
-    App->>Proxy: 補正リクエスト（rawTranscript + 抽出用語）
-    Proxy->>Claude: Haiku 4.5（プロンプトキャッシュ有効）
-    Claude-->>Proxy: 補正テキスト
-    Proxy-->>App: 補正テキスト
-    App->>DB: correctedText保存、state → corrected
-    App-->>U: 補正結果表示
-```
-
-### 6.2 ドキュメントスキャン → 用語抽出フロー
-
-```mermaid
-sequenceDiagram
-    participant U as ユーザー
-    participant App as iOSアプリ
-    participant VK as VisionKit
-    participant OCR as Vision Framework
-    participant DB as SwiftData
-    participant Proxy as バックエンドプロキシ
-    participant Claude as Claude API
-
-    U->>App: 資料スキャンボタン押下
-    App->>VK: ドキュメントカメラ起動
-    U->>VK: 資料を撮影（複数ページ可）
-    VK-->>App: スキャン画像（Data配列）
-    App->>OCR: VNRecognizeTextRequest（日本語+英語）
-    OCR-->>App: 認識テキスト（ページごと）
-    App->>DB: ScannedDocument保存
-    App-->>U: OCR結果プレビュー表示
-
-    Note over App,Claude: 用語抽出（補正精度向上のため）
-    App->>Proxy: 用語抽出リクエスト（OCRテキスト）
-    Proxy->>Claude: Haiku 4.5（用語抽出プロンプト）
-    Claude-->>Proxy: 構造化用語リスト（JSON）
-    Proxy-->>App: 用語リスト
-    App->>DB: TermEntry保存
-```
-
-### 6.3 ノート生成フロー
-
-```mermaid
-sequenceDiagram
-    participant U as ユーザー
-    participant App as iOSアプリ
-    participant DB as SwiftData
-    participant Proxy as バックエンドプロキシ
-    participant Claude as Claude API
-
-    U->>App: ノート生成ボタン押下
-    U->>App: テンプレート選択（学習ノート/議事メモ）
-    App->>DB: state → noteGenerating
-    App->>Proxy: ノート生成リクエスト（correctedText + 用語 + テンプレート）
-    Proxy->>Claude: Sonnet 4.6
-    Claude-->>Proxy: ノート（Markdown）
-    Proxy-->>App: ノート
-    App->>DB: Note保存、state → completed
-    App-->>U: ノート表示（S05）
-```
-
-### 6.4 Todo抽出フロー（Phase 2）
-
-```mermaid
-sequenceDiagram
-    participant U as ユーザー
-    participant App as iOSアプリ
-    participant Proxy as バックエンドプロキシ
-    participant Claude as Claude API
-    participant DB as SwiftData
-
-    U->>App: Todo抽出ボタン押下
-    App->>Proxy: Todo抽出リクエスト（ノートテキスト）
-    Proxy->>Claude: Haiku 4.5（JSON出力）
-    Claude-->>Proxy: Todoリスト（JSON）
-    Proxy-->>App: Todoリスト
-    App->>DB: TodoItem配列保存
-    App-->>U: Todoリスト表示（編集可能）
-```
-
----
-
-## 7. Claude API 設計
-
-### 7.1 用語抽出プロンプト
+**目的**: OCR全文をそのまま渡さず、補正に効く語彙だけへ圧縮する
 
 ```
 System:
@@ -612,7 +620,8 @@ System:
 抽出ルール:
 - 一般的な日本語語彙は除外し、誤認識されやすい用語のみ抽出する
 - 英語の専門用語はそのまま抽出する
-- 読みが自明でない用語のみreadingを付与する
+- 略語がある場合は正式名称を term に、略語を reading に記載する
+- 読みが自明でない用語のみ reading を付与する
 ```
 
 ```
@@ -622,331 +631,351 @@ Human:
 {ocrText}
 ```
 
-**使用モデル**: `claude-haiku-4-5-20251001`
+**モデル**: `claude-haiku-4-5-20251001`
 
----
+### 9.2 補正プロンプト
 
-### 7.2 ASR補正プロンプト
+**目的**: raw segment を意味改変せずに修正する
 
 ```
 System（キャッシュ対象）:
 あなたは音声文字起こしの補正専門AIです。
-以下の用語リストを参考に、文字起こしテキストの誤認識を修正してください。
+以下の用語リストを参考に、文字起こしセグメントの誤認識を修正してください。
 
 【参考用語リスト】
-{extractedTerms を "term (reading) [category]" 形式で列挙}
+{terms を "term (reading) [category]" 形式で列挙}
 
 補正ルール:
 - 用語リストに含まれる専門用語・固有名詞・数字を優先して使用する
 - 文脈から明らかな誤認識のみ修正し、意味のある言い回しは変えない
 - 話し言葉のスタイルを維持する
-- 補正後のテキストのみを出力する（説明は不要）
+- セグメントの分割は変更しない
+- 各セグメントに対して補正後テキストと信頼度スコア（0.0〜1.0）を返す
+- 信頼度が低い箇所（曖昧な修正）は 0.7 未満とする
+
+出力形式（JSON）:
+{
+  "segments": [
+    {"index": 0, "correctedText": "...", "confidenceScore": 0.95},
+    {"index": 1, "correctedText": "...", "confidenceScore": 0.62}
+  ]
+}
 ```
 
 ```
 Human（キャッシュ非対象）:
-以下の文字起こしテキストを補正してください:
+以下の文字起こしセグメントを補正してください:
 
-{rawTranscript（チャンク分割時は1チャンク分）}
+{segments を index, rawText, startTime, endTime で列挙}
 ```
 
-**使用モデル**: `claude-haiku-4-5-20251001`  
-**キャッシュ戦略**: Systemプロンプト（用語リスト含む）に `cache_control: {"type": "ephemeral"}` を設定。同一セッション内でのチャンク分割処理時にキャッシュヒット。  
-**チャンク分割**: 文字起こしテキストが約4,000文字を超える場合、セグメントのタイムスタンプ境界で分割して複数回呼び出す。
+**モデル**: `claude-haiku-4-5-20251001`  
+**キャッシュ戦略**: Systemプロンプト（用語リスト含む）に `cache_control: {"type": "ephemeral"}` を設定。チャンク分割時にキャッシュヒット。  
+**チャンク分割**: 合計約4,000文字を超える場合、セグメント境界で分割して複数回呼び出す。
 
----
+### 9.3 根拠付きノート生成プロンプト
 
-### 7.3 ノート生成プロンプト
+**目的**: ノート本文だけでなく、ブロックごとの evidence を生成する
 
 ```
 System（キャッシュ対象）:
-あなたは講義・会議の内容を整理するAIアシスタントです。
-以下のフォーマットでノートを作成してください。
+あなたは講義・会議の内容を構造化するAIアシスタントです。
+補正済みセグメント列から、根拠付きのノートを生成してください。
 
 【テンプレート: {noteType}】
-- studyNote（学習ノート）: トピック・主要概念・詳細説明・まとめ・キーワード
-- meetingMemo（議事メモ）: 日時・議題・決定事項・未決事項・次のアクション
+- studyNote: トピック → 主要概念 → 詳細説明 → まとめ → キーワード
+- meetingMemo: 議題 → 決定事項 → 未決事項 → 次のアクション
 
 【参考用語リスト】
-{extractedTerms}
+{terms}
 
-出力形式: Markdown
-```
+必須ルール:
+- 各ブロックに最低1件の evidence（元セグメントからの引用）を付与する
+- evidence の quote は元セグメントの原文をそのまま引用する（50文字以内）
+- evidence の segmentIndex, startTime, endTime は元セグメントと一致させる
+- 元発話で確認できない推論や補足は blockType を "inference" とし、confidenceScore を 0.5 以下にする
+- 根拠が十分なブロックは confidenceScore を 0.8 以上にする
 
-```
-Human（キャッシュ非対象）:
-以下の文字起こしから{noteType}形式でノートを作成してください:
-
-{correctedFullText}
-```
-
-**使用モデル**: `claude-sonnet-4-6`（高品質な構造化出力が必要なため）
-
----
-
-### 7.4 Todo抽出プロンプト（Phase 2）
-
-```
-System:
-あなたはアクションアイテム抽出の専門AIです。
-テキストからTodoを抽出し、以下のJSON形式で出力してください。
-
-出力形式:
+出力形式（JSON）:
 {
-  "todos": [
+  "noteBlocks": [
     {
-      "title": "タスクの内容",
-      "dueDate": "YYYY-MM-DD または null",
-      "sourceQuote": "元テキストの該当箇所（50文字以内）"
+      "order": 1,
+      "heading": "見出し",
+      "body": "本文（Markdown）",
+      "blockType": "concept|decision|summary|action|inference",
+      "confidenceScore": 0.91,
+      "evidences": [
+        {
+          "segmentIndex": 12,
+          "quote": "元セグメントからの引用",
+          "startTime": 120.4,
+          "endTime": 126.8
+        }
+      ]
     }
   ]
 }
 ```
 
-**使用モデル**: `claude-haiku-4-5-20251001`
+```
+Human（キャッシュ非対象）:
+以下の補正済みセグメントから{noteType}形式のノートを生成してください:
 
----
-
-## 8. バックエンドプロキシ設計
-
-### 8.1 概要
-
-APIキーの保護とコスト制御のため、すべての外部API呼び出しをバックエンドプロキシ経由で行う。
-
-### 8.2 技術選定
-
-| 候補 | 選定 | 理由 |
-|------|------|------|
-| Cloudflare Workers | ◎ | エッジ実行・低レイテンシ・無料枠10万リクエスト/日 |
-| AWS Lambda | ○ | 実績豊富だがコールドスタートが課題 |
-| Vercel Functions | ○ | Next.jsと親和性が高いが本件では不要 |
-
-### 8.3 エンドポイント
-
-| メソッド | パス | 処理 |
-|----------|------|------|
-| POST | /v1/transcribe | 音声ファイルをWhisper APIに転送、セグメント配列を返却 |
-| POST | /v1/extract-terms | OCRテキストをClaude APIに送信、用語リストを返却 |
-| POST | /v1/correct | 文字起こし＋用語をClaude APIに送信、補正テキストを返却 |
-| POST | /v1/generate-note | 補正テキスト＋テンプレートをClaude APIに送信、ノートを返却 |
-| POST | /v1/extract-todos | ノートテキストをClaude APIに送信、Todoリストを返却（Phase 2） |
-
-### 8.4 認証・レート制限
-
-- **Phase 1**: デバイスUUID ＋ アプリバンドルIDのHMAC署名で認証（ログイン不要）
-- **Phase 3**: Firebase Auth トークンに切り替え
-- **レート制限**: デバイスあたり1日10セッション、1セッション最大90分
-- **コスト上限**: 月額APIコスト総額にアラート閾値を設定
-
----
-
-## 9. セキュリティ設計
-
-### 9.1 データ保護
-
-| データ | 保存場所 | 保護方式 |
-|--------|----------|----------|
-| 音声ファイル（.m4a） | iOS Documents | NSFileProtectionComplete（デバイスロック時アクセス不可） |
-| 文字起こし・ノート | SwiftData（SQLite） | NSFileProtectionComplete |
-| スキャン画像 | iOS Documents | NSFileProtectionComplete |
-
-### 9.2 API通信のセキュリティ
-
-- すべてのAPI通信はHTTPS（TLS 1.3）
-- APIキーはバックエンドプロキシのみが保持し、iOSアプリには埋め込まない
-- アプリ → プロキシ間の認証はデバイスUUID署名（Phase 1）/ Firebaseトークン（Phase 3）
-- 音声ファイルはWhisper API（プロキシ経由）にのみ送信。Claude APIにはテキストのみ送信
-
-### 9.3 プライバシー配慮
-
-- 個人情報マスキング：メールアドレス・電話番号を `[PERSONAL_INFO]` に置換（オプション設定）
-- Whisper APIへの音声送信はユーザーに明示する（初回利用時の説明画面）
-
-### 9.4 Firebase セキュリティルール（Phase 3）
-
-4.2節のFirestoreスキーマに対応するセキュリティルールを参照。
-
----
-
-## 10. バックグラウンド録音設計
-
-### 10.1 AVAudioSession構成
-
-```swift
-let session = AVAudioSession.sharedInstance()
-try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
-try session.setActive(true)
-
-// Info.plist に UIBackgroundModes: audio を設定
+{correctedSegments を index, correctedText, startTime, endTime で列挙}
 ```
 
-### 10.2 割り込みハンドリング
+**モデル**: `claude-sonnet-4-6`
 
-| イベント | 対応 |
-|----------|------|
-| 電話着信 | 録音を一時停止、通話終了後に再開。中断区間をセグメントで記録 |
-| アラーム | 録音を一時停止、解除後に再開 |
-| 他アプリの音声 | 録音を継続（ミキシング） |
-| メモリ警告 | バッファをフラッシュしてファイル書き込み |
+### 9.4 レビューキュー生成（ローカル処理）
 
-### 10.3 バッテリー・ストレージ目安
+レビューキューはAPI呼び出しではなく、ローカルのルールベースで生成する。
 
-| 録音時間 | ファイルサイズ（AAC 64kbps） | バッテリー消費（目安） |
-|----------|---------------------------|---------------------|
-| 30分 | ~15 MB | ~3% |
-| 60分 | ~30 MB | ~5% |
-| 90分 | ~45 MB | ~8% |
+**レビュー対象の判定ルール**:
+
+| ルール | 優先度 | 対象 |
+|--------|--------|------|
+| セグメント confidenceScore < 0.7 | 高 | lowConfidenceSegment |
+| ノートブロックに evidence が 0 件 | 高 | weakEvidenceBlock |
+| ノートブロック confidenceScore < 0.6 | 中 | weakEvidenceBlock |
+| ノートブロック blockType が "inference" | 中 | weakEvidenceBlock |
+| 用語メモリに近いが未一致な語が存在 | 低 | lowConfidenceSegment |
 
 ---
 
-## 11. オフラインキュー設計
+## 10. ローカルデータ戦略
 
-### 11.1 方針
+### 10.1 保存単位
 
-- オフライン時でも録音とローカル保存は完全に動作する
-- ネットワークを必要とする処理（文字起こし・補正・ノート生成）はキューに保留する
-- ネットワーク復帰時に自動でキューを処理する
+| データ | 保存先 |
+|--------|--------|
+| 音声ファイル | Documents 配下 |
+| OCR画像 | Documents 配下 |
+| 構造化データ | SwiftData |
 
-### 11.2 実装
+### 10.2 保存ポリシー
+
+- 音声は相対パスで保持し、移動耐性を持たせる
+- ノートは `markdown` と `blocks` の両方を保持する
+- evidence はブロック側にネストせず独立モデルで持ち、後から再構築しやすくする
+
+---
+
+## 11. 音声再生設計（Evidence Playback）
+
+### 11.1 概要
+
+ノートブロックの根拠引用（EvidenceAnchor）から元音声の該当区間を再生する機能。KoeNote の「信頼できるノート」体験の中核。
+
+### 11.2 再生仕様
+
+| 項目 | 仕様 |
+|------|------|
+| 再生区間 | `startTime - 2秒` 〜 `endTime + 2秒`（前後にバッファ） |
+| 再生速度 | 1.0x / 1.5x / 2.0x 切替可 |
+| UI | インライン再生（ミニプレイヤー） |
+| 操作 | タップで再生/停止、スワイプで前後セグメントへ |
+
+### 11.3 実装方針
 
 ```swift
-class OfflineQueue {
-    /// NWPathMonitor でネットワーク状態を監視
-    /// ネットワーク復帰時に pendingSessions を処理
+class EvidencePlayer {
+    private let audioEngine = AVAudioPlayerNode()
 
-    func enqueue(session: Session) {
-        // processingState が recorded/transcribed の Session を検出
-        // ネットワーク復帰後に自動実行
-    }
-
-    func processNext() async {
-        // 1. recorded → transcribing: Whisper API呼び出し
-        // 2. transcribed → correcting: Claude API呼び出し
-        // 3. 失敗時: state → failed, failureReason記録, リトライポリシーに従う
+    func play(evidence: EvidenceAnchor, audioPath: String) {
+        let start = max(0, evidence.startTime - 2.0)
+        let end = evidence.endTime + 2.0
+        // AVAudioFile のフレーム位置を計算し、区間再生
     }
 }
 ```
 
-### 11.3 リトライポリシー
-
-| 失敗種別 | リトライ | 間隔 |
-|----------|---------|------|
-| ネットワークエラー | 最大3回 | 指数バックオフ（5s → 15s → 45s） |
-| APIレート制限（429） | 最大3回 | Retry-Afterヘッダーに従う |
-| サーバーエラー（5xx） | 最大2回 | 30秒後 |
-| クライアントエラー（4xx） | リトライなし | — |
+- 音声ファイルは端末内に保持されているため、ネットワーク不要
+- 複数の evidence を連続再生するモード（セッション通し聴き）も将来対応可
 
 ---
 
-## 12. APIコスト試算
+## 12. 処理完了通知
 
-### 前提条件
+### 12.1 概要
 
-- 1セッション = 平均60分の講義/セミナー
-- 文字起こし平均文字数: 約12,000文字（日本語 / 200文字/分）
-- 日本語テキストのトークン換算: 1文字 ≈ 1.5トークン（平均）
+録音停止後のパイプライン処理（文字起こし → 補正 → ノート生成）はバックグラウンドで数分かかる。ユーザーが他の作業をしている間に処理が完了したことをプッシュ通知で伝える。
+
+### 12.2 通知タイミング
+
+| イベント | 通知内容 |
+|----------|---------|
+| ノート生成完了 | 「📝 [セッション名] のノートが完成しました」 |
+| レビュー対象あり | 「⚠ [N]件の確認事項があります」（ノート完了通知に併記） |
+| 処理失敗 | 「❌ [セッション名] の処理でエラーが発生しました」 |
+
+### 12.3 実装方針
+
+- `UNUserNotificationCenter` によるローカル通知
+- パイプライン完了時に `SessionPipeline` から通知をスケジュール
+- アプリがフォアグラウンドの場合はバナー表示のみ
+
+---
+
+## 13. バックグラウンドと障害対応
+
+### 13.1 録音
+
+- `UIBackgroundModes: audio` を利用
+- 端末ロック中の録音継続を前提設計
+- 割り込み時はセグメント境界を記録
+
+### 13.2 オフラインキュー
+
+```swift
+final class OfflinePipelineQueue {
+    func enqueueTranscription(for sessionId: UUID) {}
+    func resumePendingJobs() async {}
+    func markFailed(sessionId: UUID, reason: String) {}
+}
+```
+
+### 13.3 リトライポリシー
+
+| 失敗種別 | リトライ |
+|----------|---------|
+| ネットワークエラー | 3回 |
+| 429 | Retry-After 優先 |
+| 5xx | 2回 |
+| 4xx | リトライしない |
+
+---
+
+## 14. セキュリティ設計
+
+### 14.1 基本方針
+
+- クライアントに秘密情報を置かない
+- 録音データは必要最小限の送信に留める
+- Phase 1 では個人利用でも安心して使えることを優先する
+
+### 14.2 具体策
+
+- APIキーはバックエンドプロキシのみ保持
+- 通信は HTTPS（TLS 1.3）前提
+- Phase 1 はデバイスUUID + バンドルIDのHMAC署名で簡易認証
+- Phase 3 で Firebase Auth トークンベースへ移行
+- 音声ファイルはASR API以外には送信しない（AI補正にはテキストのみ）
+
+---
+
+## 15. Firestore 設計（Phase 3）
+
+### 15.1 コレクション
+
+```
+/users/{userId}
+/projects/{projectId}
+/projects/{projectId}/members/{userId}
+/projects/{projectId}/sessions/{sessionId}
+/projects/{projectId}/terms/{termId}
+```
+
+### 15.2 方針
+
+- `memberIds` はルール判定用に保持
+- 詳細ロールは `members` サブコレクションで管理
+- セッション共有時は note, review, term memory を含める
+
+---
+
+## 16. コスト試算
+
+### 16.1 前提条件
+
+- 1セッション = 平均60分
+- 文字起こし平均文字数: 約12,000文字（200文字/分）
+- 日本語トークン換算: 1文字 ≈ 1.5トークン
 - OCRテキスト: 約3,000文字（A4×5枚）
-- 補正チャンク分割: 3チャンク（1チャンク ≈ 4,000文字）
+- 補正チャンク分割: 3チャンク
 
-### Whisper API コスト
+### 16.2 セッションあたりコスト
 
-| 処理 | 単価 | 時間 | コスト |
-|------|------|------|--------|
-| 音声文字起こし | $0.006/分 | 60分 | **$0.36** |
-
-### Claude API コスト（1セッションあたり）
-
-| 処理 | モデル | 入力トークン | 出力トークン | 概算コスト |
-|------|--------|-------------|-------------|-----------|
+| 処理 | モデル | 入力トークン | 出力トークン | コスト |
+|------|--------|-------------|-------------|--------|
+| 音声文字起こし | Whisper | — | — | $0.36 |
 | 用語抽出 | Haiku 4.5 | ~5,000 | ~1,000 | ~$0.01 |
-| ASR補正（3チャンク、キャッシュ有効） | Haiku 4.5 | ~20,500 | ~18,000 | ~$0.10 |
-| ノート生成 | Sonnet 4.6 | ~22,000 | ~2,000 | ~$0.10 |
-| Todo抽出（Phase 2） | Haiku 4.5 | ~4,000 | ~1,000 | ~$0.01 |
+| 補正（3チャンク） | Haiku 4.5 | ~20,500 | ~18,000 | ~$0.10 |
+| ノート生成 | Sonnet 4.6 | ~22,000 | ~3,000 | ~$0.11 |
+| **合計** | | | | **~$0.58** |
 
-### セッション合計
-
-| パターン | コスト |
-|----------|--------|
-| 補正のみ（ノート未生成） | **~$0.47** |
-| ノート生成あり | **~$0.57** |
-| ノート ＋ Todo（Phase 2） | **~$0.58** |
-
-### 月額コスト試算（ユーザー1人・週2回利用）
+### 16.3 月額試算（1ユーザー・週2回）
 
 | パターン | 月額 |
 |----------|------|
-| 補正のみ | ~$3.8/月 |
-| ノート生成あり | ~$4.6/月 |
+| フル利用 | ~$4.6 |
 
-**備考**: コストの約63%はWhisper API（$0.36/セッション）が占める。ユーザー規模拡大時は、faster-whisper等のセルフホストASRへの移行がコスト削減の主要施策となる。
+### 16.4 コストの支配要因と抑制策
 
----
-
-## 13. ディレクトリ構成（Xcodeプロジェクト）
-
-```
-KoeNote/
-├── App/
-│   ├── KoeNoteApp.swift
-│   └── ContentView.swift
-├── Features/
-│   ├── Home/
-│   │   ├── HomeView.swift
-│   │   └── HomeViewModel.swift
-│   ├── Recording/
-│   │   ├── RecordingView.swift
-│   │   ├── RecordingViewModel.swift
-│   │   └── WaveformView.swift
-│   ├── Session/
-│   │   ├── SessionDetailView.swift
-│   │   └── SessionDetailViewModel.swift
-│   ├── Scanner/
-│   │   ├── DocumentScannerView.swift
-│   │   ├── ScannerViewModel.swift
-│   │   └── ScannedPageGridView.swift
-│   ├── Note/
-│   │   ├── NoteEditorView.swift
-│   │   └── NoteViewModel.swift
-│   └── Todo/                        # Phase 2
-│       ├── TodoListView.swift
-│       └── TodoViewModel.swift
-├── Services/
-│   ├── AudioRecorder.swift          # AVFoundation録音ラッパー
-│   ├── RealtimePreviewService.swift # SFSpeechRecognizerプレビュー
-│   ├── OCRService.swift             # Vision Frameworkラッパー
-│   ├── APIGatewayClient.swift       # バックエンドプロキシクライアント
-│   └── OfflineQueue.swift           # オフラインキュー管理
-├── Models/
-│   ├── Session.swift
-│   ├── TranscriptSegment.swift
-│   ├── ScannedDocument.swift
-│   ├── TermEntry.swift
-│   ├── Note.swift
-│   └── TodoItem.swift               # Phase 2
-├── Shared/
-│   ├── Extensions/
-│   └── Components/
-└── Resources/
-    └── Info.plist
-```
+- **Whisper API が全体の62%**（$0.36/セッション）を占める
+- コスト抑制策:
+  - OCR全文ではなく用語抽出結果を補正へ渡す（トークン削減）
+  - セグメントを適切にチャンク化しキャッシュヒット率を上げる
+  - ノート生成は構造化JSONで冗長文を減らす
+  - ユーザー規模拡大時は faster-whisper セルフホストASRへの移行を検討
 
 ---
 
-## 14. 検証方法
+## 17. 検証戦略
 
-### Phase 1 検証項目
+### 17.1 技術検証
 
-| # | 検証対象 | 方法 | 合格基準 |
-|---|---------|------|----------|
-| 1 | 録音完了率 | 実機で30分・60分・90分の録音を各5回 | 95%以上で音声ファイル保存成功 |
-| 2 | バックグラウンド録音 | 画面オフ→30分後に確認 | 録音継続・ファイル完全 |
-| 3 | Whisper ASR精度 | WER計測（手動採点20サンプル） | WER < 20%（日本語） |
-| 4 | AI補正効果（資料なし） | 補正前後WER比較（20サンプル） | 補正前比で20%以上改善 |
-| 5 | AI補正効果（資料あり） | 補正前後WER比較（20サンプル） | 補正前比で30%以上改善 |
-| 6 | 資料有無の精度差 | 同一音声で資料あり/なしを比較 | 資料ありのほうがWER低い |
-| 7 | OCR精度 | A4資料10枚でOCRテキスト確認 | 認識率 > 95% |
-| 8 | ノート生成E2E | 録音→文字起こし→補正→ノート生成の完走 | 10セッション中9以上で完走 |
-| 9 | ノート品質 | 5段階評価（10サンプル） | 平均4.0以上 |
-| 10 | オフライン→復帰 | 機内モードで録音→復帰後に処理再開 | 自動で文字起こし・補正が完走 |
-| 11 | 処理時間 | 60分音声のE2E処理時間 | 文字起こし10分＋補正3分＋ノート1分以内 |
-| 12 | エラーリカバリ | 補正中にネットワーク切断→復帰 | failed状態から再実行で完走 |
+| # | 項目 | 方法 | 合格基準 |
+|---|------|------|----------|
+| 1 | 60分録音 | 実機で5回 | ファイル破損なし |
+| 2 | 90分録音 | 実機で3回 | アプリクラッシュなし |
+| 3 | バックグラウンド録音 | 画面オフ→30分後確認 | 録音継続・ファイル完全 |
+| 4 | 文字起こし速度 | 60分音声で計測 | 10分以内 |
+| 5 | OCR精度 | 資料10枚 | 認識率 > 95% |
+| 6 | オフライン→復帰 | 機内モードで録音→復帰 | 自動で処理完走 |
+
+### 17.2 価値検証
+
+| # | 項目 | 方法 | 合格基準 |
+|---|------|------|----------|
+| 1 | 根拠付きノート | ノートブロック検査 | 90%以上に evidence 存在 |
+| 2 | 資料活用効果 | 同一音声で資料あり/なし比較 | 資料ありのほうがWER低い |
+| 3 | 補正精度（資料あり） | WER計測（20サンプル） | 補正前比 30%以上改善 |
+| 4 | レビューキュー有効性 | 実修正箇所との照合 | 70%以上を先回り検出 |
+| 5 | 手修正時間 | 被験者5名で計測 | 平均5分以内 |
+| 6 | 用語メモリ効果 | 同テーマ2回目セッションの精度 | 1回目より改善 |
+
+### 17.3 UX検証
+
+| # | 項目 | 方法 | 合格基準 |
+|---|------|------|----------|
+| 1 | 初回録音開始 | 初見ユーザー5名 | 30秒以内に開始 |
+| 2 | ノート信頼感 | 5段階評価アンケート | 平均4.0以上 |
+| 3 | 根拠再生体験 | 被験者に引用タップを促す | 「元音声が聞けて安心」の回答70%以上 |
+| 4 | レビューキューUX | 被験者にレビュー操作を依頼 | 「全文見直しより楽」の回答80%以上 |
+| 5 | 処理待ち体験 | パイプライン処理中の行動観察 | 通知を受けて再開できる |
+
+---
+
+## 18. 実装優先順位
+
+### 18.1 先に作るもの
+
+1. 録音の堅牢化（バックグラウンド・割り込み対応）
+2. 録音後ASR（Whisper API連携）
+3. セグメント保存（タイムスタンプ付き）
+4. OCR + 用語抽出
+5. 用語メモリ（ローカル）
+6. AI補正（信頼度スコア付き）
+7. 根拠付きノート生成
+8. Evidence Playback（音声区間再生）
+9. レビューキュー
+10. 処理完了通知
+
+### 18.2 後回しにするもの
+
+1. 高度なリアルタイム表示
+2. 派手な差分可視化
+3. クラウド同期
+4. チーム共同編集
+
