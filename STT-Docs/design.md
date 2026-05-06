@@ -1,4 +1,4 @@
-# KoeNote（コエノート）— 設計書
+# EchoNote（エコーノート）— 設計書
 
 **バージョン**: 3.0  
 **作成日**: 2026-04-19  
@@ -10,7 +10,7 @@
 
 ### 1.1 設計原則
 
-KoeNote の設計は、次の4原則に従う。
+EchoNote の設計は、次の4原則に従う。
 
 1. **録音は絶対に落とさない**
 価値の起点は音声データであるため、録音の堅牢性を最優先とする。
@@ -27,45 +27,47 @@ KoeNote の設計は、次の4原則に従う。
 ### 1.2 全体アーキテクチャ
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     iOS App（SwiftUI）                        │
-│                                                              │
-│  Recording UI   Session UI   Note UI   Review Queue UI       │
-│       │            │           │             │                │
-│       └────────────┴───────────┴─────────────┘                │
-│                           │                                  │
-│   ┌───────────────────────▼───────────────────────────────┐   │
-│   │                  Application Layer                    │   │
-│   │ RecordingCoordinator                                  │   │
-│   │ SessionPipeline                                       │   │
-│   │ NoteComposer                                          │   │
-│   │ ReviewQueueBuilder                                    │   │
-│   │ ContextMemoryManager                                  │   │
-│   └───────────────┬───────────────────────┬───────────────┘   │
-│                   │                       │                   │
-│   ┌───────────────▼─────────────┐ ┌──────▼────────────────┐  │
-│   │ Local Persistence            │ │ Device Services       │  │
-│   │ SwiftData                    │ │ AVFoundation          │  │
-│   │ Session / Segment / Note     │ │ Vision / VisionKit    │  │
-│   │ Evidence / ReviewItem / Term │ │ SFSpeechRecognizer    │  │
-│   └───────────────┬─────────────┘ └──────────┬────────────┘  │
-│                   │                           │               │
-└───────────────────┼───────────────────────────┼───────────────┘
-                    │                           │
-                    │ HTTPS                     │ Local preview only
-                    ▼                           ▼
-          ┌──────────────────────┐    ┌────────────────────────┐
-          │ Backend Proxy        │    │ Realtime Preview ASR    │
-          │ Auth / Rate Limit    │    │ SFSpeechRecognizer      │
-          │ Cost Control         │    │ 非保存・参考表示のみ     │
-          └──────┬─────────┬─────┘    └────────────────────────┘
-                 │         │
-        ┌────────▼───┐ ┌──▼─────────────┐
-        │ OpenAI API │ │ Anthropic API  │
-        │ ASR        │ │ Correction /   │
-        │            │ │ Note / Terms   │
-        └────────────┘ └────────────────┘
+┌─────────────────────────────┐         ┌──────────────────────────────────────────────────────────────┐
+│  Apple Watch App            │         │                  iPhone App（Expo / React Native）            │
+│  (SwiftUI / watchOS 10+)    │         │                                                              │
+│                             │         │  Recording UI   Session UI   Note UI   Review Queue UI       │
+│  RecordingManager           │         │       │            │           │             │                │
+│  (AVAudioRecorder)          │         │       └────────────┴───────────┴─────────────┘                │
+│  ConnectivityManager        │         │                           │                                  │
+│  (WCSession.transferFile)   │         │   ┌───────────────────────▼───────────────────────────────┐   │
+│         │                   │         │   │                  Application Layer (TS)               │   │
+│         │  m4a + metadata   │         │   │ RecordingCoordinator   AutoPipeline                   │   │
+│         │  (bookmarks,      │         │   │ SessionPipeline        WatchRecordings importer       │   │
+│         │   duration)       │         │   │ NoteComposer / ReviewQueueBuilder                     │   │
+│         │                   │         │   │ ContextMemoryManager                                  │   │
+│         └────────────────────────────►│   └───────────────┬───────────────────┬───────────────────┘   │
+│                             │ WC      │                   │                   │                       │
+│                             │ Session │   ┌───────────────▼─────────┐ ┌───────▼──────────────────┐   │
+└─────────────────────────────┘         │   │ Local Persistence (RN)  │ │ Native Bridges (Swift)   │   │
+                                        │   │ Zustand + AsyncStorage  │ │ WatchBridge (WCSession)  │   │
+                                        │   │ expo-file-system audio  │ │ AVFoundation 録音         │   │
+                                        │   │ Session / Segment / Note│ │ VisionKit OCR             │   │
+                                        │   │ Evidence / ReviewItem   │ │                           │   │
+                                        │   └───────────────┬─────────┘ └───────────┬───────────────┘   │
+                                        │                   │                       │                   │
+                                        └───────────────────┼───────────────────────┼───────────────────┘
+                                                            │                       │
+                                                            │ HTTPS                 │ Local preview only
+                                                            ▼                       ▼
+                                                  ┌──────────────────────┐    ┌────────────────────────┐
+                                                  │ Backend Proxy        │    │ Realtime Preview ASR    │
+                                                  │ Auth / Rate Limit    │    │ SFSpeechRecognizer      │
+                                                  │ Cost Control         │    │ 非保存・参考表示のみ     │
+                                                  └──────┬─────────┬─────┘    └────────────────────────┘
+                                                         │         │
+                                                ┌────────▼───┐ ┌──▼─────────────┐
+                                                │ OpenAI API │ │ Anthropic API  │
+                                                │ ASR        │ │ Correction /   │
+                                                │            │ │ Note / Terms   │
+                                                └────────────┘ └────────────────┘
 ```
+
+> 実装メモ：iPhone 本体は Expo（React Native）で構築している。Watch コンパニオンと、Watch からの受信を担う `WatchBridge` のみが Swift 製で、Expo の bare workflow としてネイティブビルドに組み込まれている。
 
 ---
 
@@ -87,7 +89,7 @@ KoeNote の設計は、次の4原則に従う。
 
 ### 2.2 差別化ポイントがどこで生まれるか
 
-| 段階 | 一般的なサービス | KoeNote |
+| 段階 | 一般的なサービス | EchoNote |
 |------|------------------|---------|
 | 文字起こし | 全文化して終わり | セグメント + 時間情報を保持 |
 | 資料活用 | OCRを添付するだけ | 用語抽出して補正へ反映 |
@@ -101,14 +103,16 @@ KoeNote の設計は、次の4原則に従う。
 
 | レイヤー | 技術 | 理由 |
 |----------|------|------|
-| UI | SwiftUI | iOS 17 以降で十分成熟 |
-| 状態管理 | Observation | 軽量で ViewModel と相性が良い |
-| 録音 | AVFoundation | バックグラウンド録音に対応 |
+| iPhone UI / アプリ層 | Expo (React Native) + expo-router | 単一コードベースで反復速度を確保し、将来の Android / Web 拡張に備える |
+| 状態管理 | Zustand + AsyncStorage 永続化 | 軽量・型安全・永続化を1か所にまとめられる |
+| 録音 | AVFoundation 経由（expo-av / native） | バックグラウンド録音に対応 |
 | リアルタイム参考表示 | SFSpeechRecognizer | プレビュー専用で利用 |
 | 録音後ASR | OpenAI API | 長時間音声に対応しやすい |
 | OCR | Vision / VisionKit | 標準フレームワークで十分 |
 | AI補正 / 用語抽出 / ノート生成 | Anthropic API | 構造化出力と要約品質を活かす |
-| ローカルDB | SwiftData | 構造化モデル管理が容易 |
+| ローカルDB | Zustand 永続化 + expo-file-system 音声ファイル | RN プロジェクトとの相性を優先 |
+| Watch コンパニオン | SwiftUI + watchOS 10、AVAudioRecorder | Watch 単体での録音とブックマーク追加 |
+| Watch ⇄ iPhone 通信 | WatchConnectivity（`transferFile`）+ Swift 製 `WatchBridge` シングルトン | iPhone がスリープでも OS が後で配信する信頼性のあるファイル転送 |
 | バックエンドプロキシ | Cloudflare Workers | キー秘匿・レート制限・低運用コスト |
 | 同期（Phase 3） | Firebase | Auth / Firestore / Storage をまとめて扱える |
 
@@ -120,7 +124,7 @@ KoeNote の設計は、次の4原則に従う。
 
 ```
 ┌──────────────────────────────┐
-│ KoeNote              [設定⚙] │
+│ EchoNote              [設定⚙] │
 ├──────────────────────────────┤
 │ [🎙 録音を開始]              │
 ├──────────────────────────────┤
@@ -143,7 +147,7 @@ KoeNote の設計は、次の4原則に従う。
 
 - セッションカード：タイトル（編集可）・録音時間・処理状態・用語蓄積状況
 - 処理状態は `SessionState` に連動
-- テーマタグ（topicKey）をカードに表示し、同テーマの連続性を示す
+- シリーズ名（seriesKey）をカードに表示し、同シリーズの連続性を示す
 
 ### S02 録音画面
 
@@ -272,7 +276,7 @@ KoeNote の設計は、次の4原則に従う。
 
 ### 5.1 モデル全体像
 
-KoeNote の中核は `Session` ではなく、**Session + Segment + Evidence + TermMemory + ReviewItem** の組み合わせである。
+EchoNote の中核は `Session` ではなく、**Session + Segment + Evidence + TermMemory + ReviewItem** の組み合わせである。
 
 ```swift
 @Model
@@ -284,7 +288,7 @@ final class Session {
     var audioRelativePath: String?
     var state: SessionState
     var failureReason: String?
-    var topicKey: String?               // 同一テーマ識別用（ユーザー設定 or AI提案）
+    var seriesKey: String?               // 同一シリーズ識別用（ユーザー設定 or AI提案）
     var pipelineAttemptId: UUID?        // 冪等性保証用
 
     @Relationship(deleteRule: .cascade)
@@ -325,7 +329,7 @@ final class ScannedDocument {
 @Model
 final class TermMemoryEntry {
     var id: UUID
-    var topicKey: String
+    var seriesKey: String
     var term: String
     var reading: String?
     var category: String
@@ -438,15 +442,15 @@ enum ReviewItemType: String, Codable {
 責務:
 
 - OCR由来の用語抽出
-- topicKey 単位の既存用語取得
+- seriesKey 単位の既存用語取得
 - 補正ジョブへ渡す用語セットの統合
 - 不要用語の無効化反映
 
-topicKey 割り当て戦略:
+seriesKey 割り当て戦略:
 
-- ユーザーがセッション作成時に手動設定（「情報工学」「マーケゼミ」等）
-- 未設定の場合、ノート生成後にAIがタイトルからトピックを提案し、ユーザーが承認する
-- 同一 topicKey のセッション間で TermMemoryEntry を共有する
+- ユーザーがセッション作成時にシリーズを手動設定（「情報工学」「マーケゼミ」等）
+- 未設定の場合、ノート生成後にAIがタイトルからシリーズ名を提案し、ユーザーが承認する
+- 同一 seriesKey のセッション間で TermMemoryEntry を共有する
 
 ### 6.4 NoteComposer
 
@@ -462,6 +466,47 @@ topicKey 割り当て戦略:
 
 - セグメント信頼度、未一致用語、根拠不足ブロックを評価
 - レビュー対象を優先度付きで生成
+
+### 6.6 WatchBridge（Swift シングルトン）
+
+責務:
+
+- アプリ起動時に `WCSession.default.activate()` を呼び、`WCSessionDelegate` として登録
+- Watch から到着した音声ファイル（`didReceive(file:)`）を `Documents/watch-recordings/<UUID>.m4a` に移動
+- 同フォルダに manifest JSON（`<UUID>.json`）を書き出す（duration / bookmarks / recordedAt / imported フラグ）
+- React Native 側はこのフォルダを監視するだけでよい（ネイティブから JS への push は持たない）
+
+実装メモ:
+
+- `AppDelegate` の `didFinishLaunchingWithOptions` で `WatchBridge.shared.activate()` を呼ぶ
+- `delegate` プロパティが weak のため、シングルトンとしてアプリ生存期間中保持する
+- 受信ファイルは iOS が一時 Inbox に置くため、デリゲート復帰前に必ず移動する
+
+### 6.7 WatchRecordings importer（`useWatchRecordings`）
+
+責務:
+
+- アプリ前面復帰／マウント時に `Documents/watch-recordings/` を走査
+- `imported: false` の manifest をループ処理
+  - 音声を `recordings/<sessionId>.m4a` にコピー
+  - Zustand session ストアに `Watch録音` セッションを `recorded` 状態で作成
+  - ブックマーク・所要時間・recordedAt を反映
+  - manifest を `imported: true` で書き戻す
+- 失敗した manifest はスキップして次へ進む（ログに警告）
+
+### 6.8 AutoPipeline（`useAutoPipeline`）
+
+責務:
+
+- 起動時／ストア更新時／前面復帰時に「`recorded` 状態のセッション」を走査
+- 1件ずつ順次 `runPipeline` を起動（`runningRef` で並列実行を抑止）
+- 失敗してもループは継続（pipelineService が `failed` に遷移する）
+
+設計判断:
+
+- 並列実行しない理由：API レート制限・端末発熱・電池消費の抑制
+- `failed` 状態は対象外（自動再試行で誤動作を増やさない）
+- セッション詳細画面の「開いた瞬間に自動起動する useEffect」と二重に発火する瞬間がありうるが、`pipelineService` が状態遷移を `transitionState` で制御しているため、二人目はそのまま no-op になる
 
 ---
 
@@ -493,7 +538,7 @@ sequenceDiagram
     Pipe->>DB: TranscriptSegment 保存
     Pipe->>DB: state=transcribed
 
-    Pipe->>Proxy: /v1/extract-terms(ocrText + topicKey)
+    Pipe->>Proxy: /v1/extract-terms(ocrText + seriesKey)
     Proxy->>AI: terms extraction
     AI-->>Proxy: terms
     Proxy-->>Pipe: terms
@@ -524,14 +569,46 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     A[OCR text] --> B[AIで用語抽出]
-    C[topicKeyに紐づく既存用語] --> D[用語統合]
+    C[seriesKeyに紐づく既存用語] --> D[用語統合]
     B --> D
     D --> E[重複除去]
     E --> F[補正プロンプトへ投入]
     F --> G[補正後に新規有効用語を更新]
 ```
 
-### 7.3 レビューキュー生成ルール
+### 7.3 Apple Watch 録音から取り込みまで
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant W as Apple Watch App
+    participant WC as WatchConnectivity (OS)
+    participant WB as iPhone WatchBridge
+    participant Imp as useWatchRecordings
+    participant AP as useAutoPipeline
+    participant P as SessionPipeline
+
+    U->>W: 録音開始 / ブックマーク追加 / 停止
+    W->>W: AVAudioRecorder で m4a を保存
+    W->>WC: transferFile(audioURL, metadata={duration, bookmarks, recordedAt})
+    Note over WC: iPhone がスリープでも OS が後で配信
+    WC-->>WB: didReceive(file)（iPhone アプリ次回起動時）
+    WB->>WB: Documents/watch-recordings/<UUID>.m4a + manifest.json を保存
+    U->>WB: iPhone EchoNote を起動 / 前面復帰
+    Imp->>WB: watch-recordings/ を走査
+    Imp->>Imp: recordings/<sessionId>.m4a へコピー、'recorded' セッション作成
+    AP->>AP: 'recorded' セッションを順次検出
+    AP->>P: runPipeline(sessionId)
+    P-->>U: 文字起こし→補正→ノート→レビュー（自動）
+```
+
+ポイント:
+
+- Watch から iPhone への配信は `transferFile` で OS が保証する。リアルタイム接続不要
+- 取り込み（importer）と自動処理（AutoPipeline）は分離されている。importer 不調でもパイプラインは止まらず、また既存の手動録音も同じ AutoPipeline で救われる
+- Watch 側の UI は「転送中…」を表示し、`didFinish` で「転送完了 ✓」に切り替える
+
+### 7.4 レビューキュー生成ルール
 
 レビュー対象は以下の複合条件で作る。
 
@@ -559,7 +636,7 @@ flowchart TD
 | Method | Path | AIモデル | 入力 | 出力 |
 |--------|------|---------|------|------|
 | POST | `/v1/transcribe` | Whisper（gpt-4o-transcribe） | 音声ファイル | `segments[]`（timestamps付き） |
-| POST | `/v1/extract-terms` | claude-haiku-4-5 | OCRテキスト, topicKey | `terms[]` |
+| POST | `/v1/extract-terms` | claude-haiku-4-5 | OCRテキスト, seriesKey | `terms[]` |
 | POST | `/v1/correct` | claude-haiku-4-5 | raw segments, terms | `correctedSegments[]` |
 | POST | `/v1/generate-note` | claude-sonnet-4-6 | corrected segments, noteType, terms | `noteBlocks[]` + `evidences[]` |
 
@@ -765,7 +842,7 @@ Human（キャッシュ非対象）:
 
 ### 11.1 概要
 
-ノートブロックの根拠引用（EvidenceAnchor）から元音声の該当区間を再生する機能。KoeNote の「信頼できるノート」体験の中核。
+ノートブロックの根拠引用（EvidenceAnchor）から元音声の該当区間を再生する機能。EchoNote の「信頼できるノート」体験の中核。
 
 ### 11.2 再生仕様
 
@@ -943,7 +1020,7 @@ final class OfflinePipelineQueue {
 | 3 | 補正精度（資料あり） | WER計測（20サンプル） | 補正前比 30%以上改善 |
 | 4 | レビューキュー有効性 | 実修正箇所との照合 | 70%以上を先回り検出 |
 | 5 | 手修正時間 | 被験者5名で計測 | 平均5分以内 |
-| 6 | 用語メモリ効果 | 同テーマ2回目セッションの精度 | 1回目より改善 |
+| 6 | 用語メモリ効果 | 同シリーズ2回目セッションの精度 | 1回目より改善 |
 
 ### 17.3 UX検証
 
