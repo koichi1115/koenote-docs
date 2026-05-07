@@ -184,13 +184,17 @@
 ---
 
 ### C1. Watch ⇄ iPhone 転送失敗
-**問題**：Apple Watch が範囲外、Bluetooth不調、ペアリング切断などで`transferFile`が完了しない。
+**問題**：Apple Watch が範囲外、Bluetooth不調、ペアリング切断、**WCSessionキューのOS側スタック（実観測あり）** などで`transferFile`が完了しない。
+
+**実観測したスタック現象**：iPhone・Watchを長時間使い続けると、WCSession のキューがOS側で滞留し、両端のアプリを起動しても配信が再開されない状態になる。両端の端末再起動で解消する。
 
 **対応**：
-- iOS WatchConnectivity は永続キューを持ち、再接続で自動配信される（信頼できる）
-- Watch側に「未送信:N件」バッジを表示
-- Watch側 `WCSession.outstandingFileTransfers` を起動時に表示
+- iOS WatchConnectivity は永続キューを持ち、再接続で自動配信される（基本は信頼できる）
+- Watch側に「未送信:N件」バッジを表示（`outstandingFileTransfers.count`）
+- Watch側 `WCSession.outstandingFileTransfers` を起動時に表示し、待機件数が0でない場合はユーザーに分かるUIで明示
 - iPhone側にも「Apple Watchから N件未受信」のホームバナー
+- **5分以上同じ件数で滞留した場合は「Watchを再起動してください」を提案**（Phase2）
+- アプリ内ヘルプの「うまく転送されない時」セクションに端末再起動の手順を明記
 
 ---
 
