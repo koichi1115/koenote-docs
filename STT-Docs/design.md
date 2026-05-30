@@ -1116,7 +1116,94 @@ final class OfflinePipelineQueue {
 
 ---
 
-## 20. 新機能アイデアと評価（2026-05）
+## 20. LINE AI仲裁 設計
+
+### 20.1 概要
+
+話し合いモードのまとめ資料をインプットとして、LLMが双方とLINEで個別に会話し解決案を提示する機能。
+相手はアプリ不要、LINE公式アカウントへのメッセージのみで参加できる。
+
+### 20.2 アーキテクチャ
+
+```
+[iOS App]
+  まとめ資料生成
+  → 「AIに仲裁を依頼する」タップ
+  → POST /v1/mediation/create
+       { summaryId, userAId }
+  ← { sessionId, secret }
+
+[Cloudflare Workers + KV]
+  sessions/{sessionId} = {
+    summary: "...",       // まとめ資料テキスト
+    secret: "...",        // HMAC署名で検証
+    threadA: [],          // User A との会話履歴
+    threadB: [],          // User B との会話履歴
+    status: "waiting_b" | "active" | "drafting" | "done",
+    expiresAt: timestamp
+  }
+
+[LINE Messaging API → Webhook → Cloudflare Workers]
+  受信メッセージ形式: "{sessionId} {secret}"（初回認証）
+  → sessionId に紐づくスレッドを特定
+  → LLM（Anthropic claude-sonnet）と会話継続
+
+[解決フロー]
+  双方の会話が収束
+  → /v1/mediation/draft でAIが解決案生成
+  → 両者に確認メッセージ送信
+  → 両者承認 → /v1/mediation/close → 同一サマリーを双方に送信
+```
+
+### 20.3 セッション状態遷移
+
+```
+waiting_b   : User A が作成済み、User B 未参加
+active      : 双方参加、個別会話中
+drafting    : AIが解決案ドラフト中、両者の確認待ち
+done        : 合意完了
+expired     : 有効期限（72時間）切れ
+```
+
+### 20.4 LLMへのコンテキスト設計
+
+```
+System（キャッシュ対象）:
+あなたは中立的な対話仲裁者です。
+以下の話し合いの記録を踏まえて、{role}（自分 / 相手）と個別に会話し、
+言い分を丁寧に聞いてください。相手の発言は開示しないでください。
+
+【話し合いの記録】
+{summary}
+
+ルール:
+- 一方の肩を持たず、双方の言い分を等しく尊重する
+- 感情を否定せず、まず受け止める
+- 20ターンを超えたら解決案のドラフトを提案する
+
+Human（キャッシュ非対象）:
+{user_message}
+```
+
+### 20.5 コスト・インフラ
+
+| 項目 | 内容 |
+|---|---|
+| LINE公式アカウント | ライトプラン（¥5,000/月）+ ¥3/通（500通超） |
+| Cloudflare Workers KV | セッションデータ保存（TTL 72時間で自動削除） |
+| Anthropic API | 1セッション最大40ターン × 約$0.02 = 最大約$0.80 |
+| 1仲裁セッションの目安コスト | ~$1.00〜1.50（LINE費用含む） |
+
+### 20.6 セキュリティ設計
+
+- secret は `HMAC-SHA256(sessionId + userId, serverSecret)` で生成
+- LINE Webhook の署名検証（`X-Line-Signature`）を必ず実施
+- セッション終了後72時間でKVデータを自動削除
+- まとめ資料テキストはKV保存時にAES-256で暗号化
+
+---
+
+## 21. 新機能アイデアと評価（2026-05）
 
 会話の中で検討・評価した機能アイデアの記録。
 
